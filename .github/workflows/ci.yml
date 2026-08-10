@@ -1,0 +1,139 @@
+name: CI
+
+# Chạy cả khi pull_request, không chỉ push: bắt lỗi TRƯỚC khi vào nhánh chính
+# mới là phần giá trị nhất của CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Push liên tiếp thì huỷ lần chạy cũ, khỏi tốn runner
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Job 1 — chạy test trên một máy sạch
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lấy source
+        uses: actions/checkout@v4
+
+      - name: Cài Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cài dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Chạy checkpoint test
+        # Máy CI không có file .env — đây chính là lợi ích của 12-Factor ở CP1:
+        # cùng một code, môi trường khác nhau chỉ khác biến môi trường.
+        env:
+          API_TOKEN: ci-dummy
+          REDIS_URL: "fake://"
+        # Loại 2 file ra khỏi CI:
+        #   test_cp5.py       — gọi vào bản deploy đang sống, chạy ở đây sẽ chậm/đỏ
+        #   test_bonus_cicd.py — kiểm tra badge của chính workflow này (vòng lặp)
+        # -m "not docker" bỏ qua test build image, đã có job `build` lo việc đó.
+        run: |
+          pytest tests/ -v -m "not docker" \
+            --ignore=tests/test_cp5.py \
+            --ignore=tests/test_bonus_cicd.py
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 2 — build image trên máy sạch (chạy song song với job test)
+  # ─────────────────────────────────────────────────────────────
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lấy source
+        uses: actions/checkout@v4
+
+      - name: Build image từ Dockerfile
+        # Bắt các lỗi kiểu "file này chỉ có trên máy tôi" hoặc .dockerignore
+        # loại nhầm thứ cần thiết — những lỗi chỉ lộ ra ở môi trường sạch.
+        run: docker build -t day12-chat:ci .
+
+      - name: Kiểm tra image dưới 400MB
+        # Đo đúng cách mà tests/test_cp2.py dùng để chấm: `docker images`.
+        # (`docker image inspect --format {{.Size}}` trả số khác vì tính theo
+        # dung lượng nén, 60MB thay vì 270MB — dễ gây hiểu nhầm.)
+        run: |
+          SIZE=$(docker images day12-chat:ci --format '{{.Size}}')
+          echo "Kích thước image: $SIZE (ngưỡng 400MB)"
+          MB=$(python3 -c "
+          import re, sys
+          s = '''$SIZE'''
+          n = float(re.sub(r'[^0-9.]', '', s) or 0)
+          print(int(n * 1024 if 'GB' in s.upper() else n))
+          ")
+          test "$MB" -lt 400
+
+      - name: Kiểm tra container không chạy bằng root
+        run: |
+          USER_INFO=$(docker run --rm --entrypoint id day12-chat:ci)
+          echo "$USER_INFO"
+          echo "$USER_INFO" | grep -qv "uid=0(root)"
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 3 — chỉ deploy khi CẢ HAI job trên đã xanh
+  # ─────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy lên Railway
+    # needs: xâu các job thành dây chuyền. Thiếu dòng này thì GitHub chạy
+    # deploy SONG SONG với test, và code hỏng vẫn lên production.
+    needs: [test, build]
+    # if: không có nó thì mỗi lần ai đó mở pull request là một lần deploy.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lấy source
+        uses: actions/checkout@v4
+
+      - name: Kiểm tra đã cấu hình RAILWAY_TOKEN chưa
+        id: guard
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        # Context `secrets` không dùng được ở `if:` cấp job, nên kiểm tra ở đây.
+        # Chưa cấu hình secret thì bỏ qua deploy chứ không làm đỏ cả workflow.
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "san_sang=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Chưa có secret RAILWAY_TOKEN — bỏ qua bước deploy. Thêm tại Settings → Secrets and variables → Actions."
+          else
+            echo "san_sang=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cài Railway CLI
+        if: steps.guard.outputs.san_sang == 'true'
+        run: npm install -g @railway/cli
+
+      - name: Deploy
+        if: steps.guard.outputs.san_sang == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service day12-chat --ci
+
+      - name: Smoke test bản vừa deploy
+        if: steps.guard.outputs.san_sang == 'true'
+        env:
+          # PUBLIC_URL là địa chỉ công khai, không phải secret → dùng Variables.
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        # Deploy xong mà không kiểm tra thì chỉ biết "lệnh chạy xong", không biết
+        # "service còn sống". curl -f trả mã lỗi khi HTTP không phải 2xx → job đỏ.
+        run: |
+          URL="${PUBLIC_URL:-https://day12-chat-production-8123.up.railway.app}"
+          echo "Gọi thử $URL/healthz"
+          curl -fsS --retry 6 --retry-delay 10 --retry-all-errors "$URL/healthz"
+          echo
