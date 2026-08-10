@@ -41,9 +41,17 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # TODO (CP1): khai báo 7 trường theo bảng trên, ví dụ:
-    #     port: int = 8000
-    #     api_token: str
+    # Không phải secret → có mặc định dùng được ngay ở laptop
+    port: int = 8000
+    redis_url: str = "redis://localhost:6379/0"
+    bucket_capacity: int = 10
+    refill_per_minute: int = 10
+    daily_budget_usd: float = 1.0
+    log_level: str = "INFO"
+
+    # Secret → KHÔNG mặc định. Thiếu biến môi trường là ValidationError ngay
+    # lúc khởi động, chứ không phải một service chạy được với token ai cũng biết.
+    api_token: str
 
 
 @lru_cache(maxsize=1)

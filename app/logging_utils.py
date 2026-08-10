@@ -35,4 +35,14 @@ def emit(event: str, severity: str = "INFO", **fields) -> str:
         >>> emit("chat_completed", client_id="sv01", usd_cost=0.0001)
         '{"event": "chat_completed", "severity": "INFO", "ts": "...", ...}'
     """
-    raise NotImplementedError("TODO (CP1): cài đặt emit")
+    payload = {
+        "event": event,
+        "severity": severity.upper(),
+        "ts": utc_now_iso(),
+        **fields,
+    }
+    # ensure_ascii=False để tiếng Việt còn đọc được; không indent để log
+    # nằm gọn trên một dòng — cloud gom log theo dòng.
+    line = json.dumps(payload, ensure_ascii=False)
+    print(line, file=sys.stdout, flush=True)
+    return line
